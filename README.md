@@ -19,11 +19,13 @@ With nestjs-pino:
 return { pinoHttp: [{ level: 'info' }, createAxiomDestination({ dataset, token })] };
 ```
 
-Call `dest.flush()` on shutdown to drain in-flight batches.
+Call `dest.flush()` on shutdown to drain in-flight batches. It rejects once with any delivery failures accumulated since the previous flush.
 
 ## Options
 
-`dataset` and `token` are required. `host` defaults to `https://api.axiom.co`. `maxBytes` (default 256 MiB) caps un-acked bytes: past it a stalled sink drops new lines instead of growing memory.
+`dataset` and `token` are required. `host` defaults to `https://api.axiom.co`; include an ingest base path in this URL when using an edge deployment. `maxBytes` defaults to 8 MiB and caps unacknowledged bytes. `timeoutMs` defaults to 10 seconds and bounds the complete delivery attempt, including retries. `onError` receives each terminal batch failure and the first capacity drop in each pressure episode.
+
+Each non-empty `write()` must contain one NDJSON event. Multi-event batches stay within 1 MiB and 10,000 events; a single event may be larger than 1 MiB. Capacity drops deliberately return `true` to keep Pino non-blocking; observe them through `onError` or the next `flush()` rejection. Both Promise-based `destination.flush()` and Pino's callback-based `logger.flush(callback)` are supported.
 
 ## Build
 

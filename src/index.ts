@@ -1,2 +1,5 @@
-export { createAxiomDestination } from './axiom-destination.js';
-export type { AxiomDestination, AxiomDestinationOptions } from './axiom-destination.js';
+/**
+ * Public package surface for the bounded Axiom destination
+ */
+export { AxiomSinkError, createAxiomDestination } from './axiom-destination.js';
+export type { AxiomDestination, AxiomDestinationOptions, AxiomSinkErrorCode } from './axiom-destination.js';

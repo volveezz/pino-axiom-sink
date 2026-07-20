@@ -1,53 +1,120 @@
+/**
+ * Bounded main-thread NDJSON delivery to Axiom for Pino and direct event producers
+ */
 import * as http from 'node:http';
 import * as https from 'node:https';
+
+export type AxiomSinkErrorCode =
+  | 'buffer_full'
+  | 'delivery_timeout'
+  | 'http_status'
+  | 'ingest_rejected'
+  | 'invalid_event'
+  | 'invalid_response'
+  | 'request_failed';
+
+export class AxiomSinkError extends Error {
+  readonly name = 'AxiomSinkError';
+
+  constructor(
+    message: string,
+    readonly code: AxiomSinkErrorCode,
+    readonly eventCount: number,
+    readonly attempts: number,
+    readonly statusCode?: number,
+    readonly responseBody?: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
 
 export interface AxiomDestinationOptions {
   dataset: string;
   token: string;
   host?: string;
   maxBytes?: number;
+  timeoutMs?: number;
+  onError?: (error: AxiomSinkError) => void;
 }
 
 export interface AxiomDestination {
   write(line: string): boolean;
   flush(): Promise<void>;
+  flush(callback: (error?: Error) => void): void;
 }
 
-const MAX_RETRIES = 3;
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms).unref());
+type AttemptResult =
+  | { type: 'response'; statusCode: number; body: string; bodyTruncated: boolean; retryAfterMs: number | null }
+  | { type: 'request_error'; error: Error };
 
-/**
- * Main-thread Axiom log sink for pino
- *
- * The obvious path (a pino transport worker) encodes batches through
- * CompressionStream, which retains external ArrayBuffers V8 never reclaims; this
- * sink stays on the main thread and writes each line straight to a keep-alive
- * socket so freed bytes stay GC-visible
- */
-export function createAxiomDestination(opts: AxiomDestinationOptions): AxiomDestination {
-  const origin = new URL(opts.host ?? 'https://api.axiom.co');
+const MAX_ATTEMPTS = 4;
+const MAX_BATCH_BYTES = 1 << 20;
+const MAX_BATCH_EVENTS = 10_000;
+const MAX_RESPONSE_BYTES = 64 << 10;
+const MAX_RETRY_DELAY_MS = 5_000;
+const MAX_RETAINED_FAILURES = 16;
+const DEFAULT_MAX_BYTES = 8 << 20;
+const DEFAULT_TIMEOUT_MS = 10_000;
+const FLUSH_INTERVAL_MS = 250;
+
+export function createAxiomDestination(options: AxiomDestinationOptions): AxiomDestination {
+  const origin = new URL(options.host ?? 'https://api.axiom.co');
   const request = origin.protocol === 'http:' ? http.request : https.request;
   const Agent = origin.protocol === 'http:' ? http.Agent : https.Agent;
   const agent = new Agent({ keepAlive: true, maxSockets: 4 });
-  const path = `/v1/datasets/${encodeURIComponent(opts.dataset)}/ingest?timestamp-field=time`;
-  const headers = { authorization: `Bearer ${opts.token}`, 'content-type': 'application/x-ndjson' };
-  const maxBytes = opts.maxBytes ?? 256 * (1 << 20);
-  const flushIntervalMs = 250;
-  const maxBatchBytes = 1 << 20;
+  const dataset = encodeURIComponent(options.dataset);
+  const basePath = origin.pathname === '/' ? `/v1/datasets/${dataset}/ingest` : `${origin.pathname.replace(/\/$/, '')}/${dataset}`;
+  const path = `${basePath}?timestamp-field=time`;
+  const headers = { authorization: `Bearer ${options.token}`, 'content-type': 'application/x-ndjson' };
+  const maxBytes = positiveOption('maxBytes', options.maxBytes ?? DEFAULT_MAX_BYTES);
+  const timeoutMs = positiveOption('timeoutMs', options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   let parts: string[] = [];
   let pendingBytes = 0;
   let unackedBytes = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let bufferFullReported = false;
+  let invalidWriteReported = false;
+  let omittedFailures = 0;
+  const retainedFailures: AxiomSinkError[] = [];
   const inFlight = new Set<Promise<void>>();
 
+  function report(error: AxiomSinkError): void {
+    if (retainedFailures.length < MAX_RETAINED_FAILURES) retainedFailures.push(error);
+    else omittedFailures++;
+    try {
+      options.onError?.(error);
+    } catch {}
+  }
+
   function write(line: string): boolean {
-    if (unackedBytes + pendingBytes > maxBytes) return true; // a stalled sink drops here rather than growing memory without bound
+    const lineBytes = Buffer.byteLength(line);
+    if (lineBytes === 0) {
+      if (!invalidWriteReported) {
+        invalidWriteReported = true;
+        report(new AxiomSinkError('Axiom sink received an empty event', 'invalid_event', 1, 0));
+      }
+      return true;
+    }
+
+    invalidWriteReported = false;
+    const bufferedBytes = unackedBytes + pendingBytes;
+    if (bufferedBytes + lineBytes > maxBytes) {
+      if (!bufferFullReported) {
+        bufferFullReported = true;
+        report(new AxiomSinkError('Axiom sink buffer is full; events are being dropped', 'buffer_full', 1, 0));
+      }
+      return true;
+    }
+
+    if (bufferFullReported && bufferedBytes + lineBytes <= maxBytes / 2) bufferFullReported = false;
+    if (parts.length > 0 && pendingBytes + lineBytes > MAX_BATCH_BYTES) flushNow();
     parts.push(line);
-    pendingBytes += Buffer.byteLength(line);
-    if (pendingBytes >= maxBatchBytes) flushNow();
+    pendingBytes += lineBytes;
+    if (pendingBytes >= MAX_BATCH_BYTES || parts.length >= MAX_BATCH_EVENTS) flushNow();
     else if (timer === null) {
-      timer = setTimeout(flushNow, flushIntervalMs);
+      timer = setTimeout(flushNow, FLUSH_INTERVAL_MS);
       timer.unref();
     }
     return true;
@@ -66,46 +133,226 @@ export function createAxiomDestination(opts: AxiomDestinationOptions): AxiomDest
     pendingBytes = 0;
     unackedBytes += bytes;
 
-    const p = post(batch).finally(() => {
-      unackedBytes -= bytes;
-      inFlight.delete(p);
-    });
-    inFlight.add(p);
-  }
-
-  async function post(batch: string[], attempt = 0): Promise<void> {
-    const { ok, retriable, retryAfterMs } = await once(batch);
-    if (ok || !retriable || attempt >= MAX_RETRIES) return; // 4xx and exhausted retries drop; a reset connection, 429, or 5xx is a transient blip worth retrying
-    await sleep(retryAfterMs ?? Math.min(250 * 2 ** attempt, 5000));
-    return post(batch, attempt + 1);
-  }
-
-  function once(batch: string[]): Promise<{ ok: boolean; retriable: boolean; retryAfterMs: number | null }> {
-    return new Promise((resolve) => {
-      const req = request({ protocol: origin.protocol, hostname: origin.hostname, port: origin.port, path, method: 'POST', agent, headers }, (res) => {
-        const status = res.statusCode ?? 0;
-        const retryAfterMs = parseRetryAfter(res);
-        res.resume();
-        res.on('end', () => resolve({ ok: status >= 200 && status < 300, retriable: status === 429 || status >= 500, retryAfterMs }));
+    const delivery = post(batch)
+      .catch((error: unknown) => report(asSinkError(error, batch.length)))
+      .finally(() => {
+        unackedBytes -= bytes;
+        inFlight.delete(delivery);
       });
-      req.on('error', () => resolve({ ok: false, retriable: true, retryAfterMs: null }));
-      for (let i = 0; i < batch.length; i++) req.write(batch[i]); // write lines individually; joining them restores the batch copy this sink avoids
+    inFlight.add(delivery);
+  }
+
+  async function post(batch: string[]): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let attempts = 0;
+    let lastRequestError: Error | undefined;
+
+    while (attempts < MAX_ATTEMPTS) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new AxiomSinkError(
+          `Axiom delivery exceeded ${timeoutMs}ms`,
+          'delivery_timeout',
+          batch.length,
+          attempts,
+          undefined,
+          undefined,
+          lastRequestError ? { cause: lastRequestError } : undefined,
+        );
+      }
+
+      attempts++;
+      const result = await once(batch, remainingMs);
+      if (result.type === 'response') {
+        if (result.statusCode >= 200 && result.statusCode < 300) {
+          validateIngestResponse(result, batch.length, attempts);
+          return;
+        }
+        if (result.statusCode !== 429 && result.statusCode < 500) {
+          throw responseError('Axiom rejected the ingest request', 'http_status', result, batch.length, attempts);
+        }
+        if (attempts >= MAX_ATTEMPTS) {
+          throw responseError('Axiom ingest retries were exhausted', 'http_status', result, batch.length, attempts);
+        }
+        await retryDelay(deadline, attempts, result.retryAfterMs);
+        continue;
+      }
+
+      lastRequestError = result.error;
+      if (attempts >= MAX_ATTEMPTS) {
+        throw new AxiomSinkError(
+          'Axiom request retries were exhausted',
+          'request_failed',
+          batch.length,
+          attempts,
+          undefined,
+          undefined,
+          { cause: result.error },
+        );
+      }
+      await retryDelay(deadline, attempts, null);
+    }
+  }
+
+  function once(batch: string[], requestTimeoutMs: number): Promise<AttemptResult> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer: ReturnType<typeof setTimeout>;
+      const settle = (result: AttemptResult): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        resolve(result);
+      };
+
+      const req = request(
+        {
+          protocol: origin.protocol,
+          hostname: origin.hostname,
+          port: origin.port,
+          path,
+          method: 'POST',
+          agent,
+          headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          let capturedBytes = 0;
+          let bodyTruncated = false;
+          res.on('data', (chunk: Buffer) => {
+            if (capturedBytes >= MAX_RESPONSE_BYTES) {
+              bodyTruncated = true;
+              return;
+            }
+            const captured = chunk.subarray(0, MAX_RESPONSE_BYTES - capturedBytes);
+            chunks.push(captured);
+            capturedBytes += captured.length;
+            if (captured.length < chunk.length) bodyTruncated = true;
+          });
+          res.on('end', () =>
+            settle({
+              type: 'response',
+              statusCode: res.statusCode ?? 0,
+              body: Buffer.concat(chunks, capturedBytes).toString('utf8'),
+              bodyTruncated,
+              retryAfterMs: parseRetryAfter(res),
+            }),
+          );
+          res.on('error', (error) => settle({ type: 'request_error', error }));
+        },
+      );
+
+      deadlineTimer = setTimeout(() => req.destroy(new Error(`Axiom request exceeded ${requestTimeoutMs}ms`)), requestTimeoutMs);
+      deadlineTimer.unref();
+      req.on('error', (error) => settle({ type: 'request_error', error }));
+      for (const line of batch) req.write(line);
       req.end();
     });
   }
 
-  async function flush(): Promise<void> {
+  async function flushAsync(): Promise<void> {
     flushNow();
-    while (inFlight.size > 0) await Promise.allSettled([...inFlight]);
+    while (inFlight.size > 0) await Promise.all([...inFlight]);
+    if (retainedFailures.length === 0) return;
+
+    const failures = retainedFailures.splice(0);
+    const omitted = omittedFailures;
+    omittedFailures = 0;
+    if (omitted > 0) {
+      failures.push(new AxiomSinkError(`${omitted} additional Axiom delivery failures omitted`, 'request_failed', 0, 0));
+    }
+    if (failures.length === 1) throw failures[0];
+    throw new AggregateError(failures, `${failures.length} Axiom delivery failures`);
+  }
+
+  function flush(): Promise<void>;
+  function flush(callback: (error?: Error) => void): void;
+  function flush(callback?: (error?: Error) => void): Promise<void> | void {
+    const operation = flushAsync();
+    if (!callback) return operation;
+    void operation.then(
+      () => {
+        try {
+          callback();
+        } catch {}
+      },
+      (error: Error) => {
+        try {
+          callback(error);
+        } catch {}
+      },
+    );
   }
 
   return { write, flush };
+
+  async function retryDelay(deadline: number, attempts: number, retryAfterMs: number | null): Promise<void> {
+    const delayMs = Math.min(retryAfterMs ?? 250 * 2 ** (attempts - 1), MAX_RETRY_DELAY_MS, Math.max(0, deadline - Date.now()));
+    if (delayMs <= 0) return;
+    await new Promise<void>((resolve) => {
+      const retryTimer = setTimeout(resolve, delayMs);
+      retryTimer.unref();
+    });
+  }
 }
 
-function parseRetryAfter(res: http.IncomingMessage): number | null {
-  const reset = (res.headers['x-ratelimit-reset'] ?? res.headers['retry-after']) as string | undefined;
-  if (!reset) return null;
-  const n = Number(reset);
-  if (!Number.isFinite(n)) return null;
-  return n > 1e6 ? Math.max(0, n * 1000 - Date.now()) : n * 1000; // x-ratelimit-reset is epoch seconds, retry-after is a delta
+function validateIngestResponse(result: Extract<AttemptResult, { type: 'response' }>, eventCount: number, attempts: number): void {
+  let response: unknown;
+  try {
+    response = result.bodyTruncated ? null : JSON.parse(result.body);
+  } catch {
+    response = null;
+  }
+
+  if (!isRecord(response) || !isCount(response.ingested) || !isCount(response.failed) || response.ingested + response.failed !== eventCount) {
+    throw responseError('Axiom returned an invalid ingest response', 'invalid_response', result, eventCount, attempts);
+  }
+  if (response.failed > 0) {
+    throw responseError('Axiom rejected events from the ingest batch', 'ingest_rejected', result, eventCount, attempts);
+  }
+}
+
+function responseError(
+  message: string,
+  code: AxiomSinkErrorCode,
+  result: Extract<AttemptResult, { type: 'response' }>,
+  eventCount: number,
+  attempts: number,
+): AxiomSinkError {
+  return new AxiomSinkError(message, code, eventCount, attempts, result.statusCode, result.body);
+}
+
+function asSinkError(error: unknown, eventCount: number): AxiomSinkError {
+  return error instanceof AxiomSinkError
+    ? error
+    : new AxiomSinkError('Unexpected Axiom sink failure', 'request_failed', eventCount, 0, undefined, undefined, {
+        cause: error,
+      });
+}
+
+function positiveOption(name: string, value: number): number {
+  if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${name} must be a positive number`);
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function parseRetryAfter(response: http.IncomingMessage): number | null {
+  const reset = response.headers['x-ratelimit-reset'];
+  const resetSeconds = Number(Array.isArray(reset) ? reset[0] : reset);
+  if (Number.isFinite(resetSeconds)) return Math.max(0, resetSeconds * 1000 - Date.now());
+
+  const retryAfter = response.headers['retry-after'];
+  const value = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
+  if (!value) return null;
+  const deltaSeconds = Number(value);
+  if (Number.isFinite(deltaSeconds)) return Math.max(0, deltaSeconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
 }

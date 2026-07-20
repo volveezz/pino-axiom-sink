@@ -1,7 +1,16 @@
 {
   "name": "pino-axiom-sink",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pino destination that streams NDJSON to Axiom on the main thread, without the memory leak of the @axiomhq/pino worker transport",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/volveezz/pino-axiom-sink.git"
+  },
+  "homepage": "https://github.com/volveezz/pino-axiom-sink#readme",
+  "bugs": {
+    "url": "https://github.com/volveezz/pino-axiom-sink/issues"
+  },
   "type": "module",
   "exports": {
     ".": {
@@ -14,19 +23,28 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
+    "src",
     "README.md"
   ],
   "engines": {
     "node": ">=20.19"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "peerDependencies": {
     "pino": "^10.3.1"
   },
   "devDependencies": {
     "@types/node": "25.6.0",
+    "pino": "^10.3.1",
     "typescript": "^6.0.3"
+  },
+  "peerDependenciesMeta": {
+    "pino": {
+      "optional": true
+    }
   }
 }

@@ -1,20 +1,25 @@
+export type AxiomSinkErrorCode = 'buffer_full' | 'delivery_timeout' | 'http_status' | 'ingest_rejected' | 'invalid_event' | 'invalid_response' | 'request_failed';
+export declare class AxiomSinkError extends Error {
+    readonly code: AxiomSinkErrorCode;
+    readonly eventCount: number;
+    readonly attempts: number;
+    readonly statusCode?: number | undefined;
+    readonly responseBody?: string | undefined;
+    readonly name = "AxiomSinkError";
+    constructor(message: string, code: AxiomSinkErrorCode, eventCount: number, attempts: number, statusCode?: number | undefined, responseBody?: string | undefined, options?: ErrorOptions);
+}
 export interface AxiomDestinationOptions {
     dataset: string;
     token: string;
     host?: string;
     maxBytes?: number;
+    timeoutMs?: number;
+    onError?: (error: AxiomSinkError) => void;
 }
 export interface AxiomDestination {
     write(line: string): boolean;
     flush(): Promise<void>;
+    flush(callback: (error?: Error) => void): void;
 }
-/**
- * Main-thread Axiom log sink for pino
- *
- * The obvious path (a pino transport worker) encodes batches through
- * CompressionStream, which retains external ArrayBuffers V8 never reclaims; this
- * sink stays on the main thread and writes each line straight to a keep-alive
- * socket so freed bytes stay GC-visible
- */
-export declare function createAxiomDestination(opts: AxiomDestinationOptions): AxiomDestination;
+export declare function createAxiomDestination(options: AxiomDestinationOptions): AxiomDestination;
 //# sourceMappingURL=axiom-destination.d.ts.map
