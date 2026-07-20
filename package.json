@@ -1,0 +1,32 @@
+{
+  "name": "pino-axiom-sink",
+  "version": "0.1.1",
+  "description": "Pino destination that streams NDJSON to Axiom on the main thread, without the memory leak of the @axiomhq/pino worker transport",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "pino": "^10.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "25.6.0",
+    "typescript": "^6.0.3"
+  }
+}
