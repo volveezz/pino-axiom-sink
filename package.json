@@ -1,6 +1,6 @@
 {
   "name": "pino-axiom-sink",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pino destination that streams NDJSON to Axiom on the main thread, without the memory leak of the @axiomhq/pino worker transport",
   "license": "MIT",
   "repository": {

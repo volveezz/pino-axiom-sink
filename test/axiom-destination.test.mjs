@@ -148,6 +148,21 @@ test('retries network, rate-limit and server failures before succeeding', async 
   assert.equal(requests, 4);
 });
 
+test('retries a stalled response within the delivery deadline', async () => {
+  let requests = 0;
+  const host = await serve(async (request, response) => {
+    await readEvents(request);
+    requests++;
+    if (requests > 1) respond(response, 1);
+  });
+  const destination = createAxiomDestination({ dataset: 'logs', token: 'token', host, timeoutMs: 2_000 });
+
+  destination.write('{}\n');
+  await destination.flush();
+
+  assert.equal(requests, 2);
+});
+
 test('does not retry terminal HTTP failures and recovers after flush reports them', async () => {
   let requests = 0;
   const host = await serve(async (request, response) => {

@@ -23,7 +23,7 @@ Call `dest.flush()` on shutdown to drain in-flight batches. It rejects once with
 
 ## Options
 
-`dataset` and `token` are required. `host` defaults to `https://api.axiom.co`; include an ingest base path in this URL when using an edge deployment. `maxBytes` defaults to 8 MiB and caps unacknowledged bytes. `timeoutMs` defaults to 10 seconds and bounds the complete delivery attempt, including retries. `onError` receives each terminal batch failure and the first capacity drop in each pressure episode.
+`dataset` and `token` are required. `host` defaults to `https://api.axiom.co`; include an ingest base path in this URL when using an edge deployment. `maxBytes` defaults to 8 MiB and caps unacknowledged bytes. `timeoutMs` defaults to 10 seconds and bounds the complete delivery, including retries; each of the four attempts gets a quarter of it, so a stalled response is retried rather than consuming the whole budget. A batch Axiom committed but acknowledged too late can land twice. `onError` receives each terminal batch failure and the first capacity drop in each pressure episode.
 
 Each non-empty `write()` must contain one NDJSON event. Multi-event batches stay within 1 MiB and 10,000 events; a single event may be larger than 1 MiB. Capacity drops deliberately return `true` to keep Pino non-blocking; observe them through `onError` or the next `flush()` rejection. Both Promise-based `destination.flush()` and Pino's callback-based `logger.flush(callback)` are supported.
 

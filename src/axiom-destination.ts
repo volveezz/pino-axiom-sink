@@ -69,6 +69,7 @@ export function createAxiomDestination(options: AxiomDestinationOptions): AxiomD
   const headers = { authorization: `Bearer ${options.token}`, 'content-type': 'application/x-ndjson' };
   const maxBytes = positiveOption('maxBytes', options.maxBytes ?? DEFAULT_MAX_BYTES);
   const timeoutMs = positiveOption('timeoutMs', options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const attemptTimeoutMs = timeoutMs / MAX_ATTEMPTS;
 
   let parts: string[] = [];
   let pendingBytes = 0;
@@ -162,7 +163,7 @@ export function createAxiomDestination(options: AxiomDestinationOptions): AxiomD
       }
 
       attempts++;
-      const result = await once(batch, remainingMs);
+      const result = await once(batch, Math.min(remainingMs, attemptTimeoutMs));
       if (result.type === 'response') {
         if (result.statusCode >= 200 && result.statusCode < 300) {
           validateIngestResponse(result, batch.length, attempts);
